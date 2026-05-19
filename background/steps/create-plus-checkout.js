@@ -370,22 +370,61 @@
         injectSource: PLUS_CHECKOUT_SOURCE,
         logMessage: '步骤 6：hosted checkout 页面仍在加载，等待脚本就绪...',
       });
-      await addLog('步骤 6：hosted checkout 已打开，正在自动切换 PayPal 并填写账单地址...', 'info');
-      const result = await sendTabMessageUntilStopped(tabId, PLUS_CHECKOUT_SOURCE, {
-        type: 'FILL_PLUS_BILLING_AND_SUBMIT',
+      await addLog('步骤 6：hosted checkout 已打开，正在按油猴脚本顺序自动切换 PayPal、填写地址并提交...', 'info');
+      const initialResult = await sendTabMessageUntilStopped(tabId, PLUS_CHECKOUT_SOURCE, {
+        type: 'RUN_HOSTED_OPENAI_CHECKOUT_STEP',
         source: 'background',
         payload: {
-          hostedCheckoutMode: true,
-          paymentMethod: PLUS_PAYMENT_METHOD_PAYPAL,
-          fullName: guestProfile.fullName,
-          addressSeed: buildHostedCheckoutAddressSeed(guestProfile.address),
-          structuredAddressTimeoutMs: 12000,
+          address: guestProfile.address,
         },
       });
-      if (result?.error) {
-        throw new Error(result.error);
+      if (initialResult?.error) {
+        throw new Error(initialResult.error);
       }
-      return result || {};
+
+      const startedAt = Date.now();
+      let verificationSubmitted = false;
+      while (Date.now() - startedAt < HOSTED_CHECKOUT_TRANSITION_TIMEOUT_MS) {
+        throwIfStopped();
+        const tab = await chrome?.tabs?.get?.(tabId).catch(() => null);
+        if (!tab) {
+          throw new Error('步骤 6：hosted checkout 标签页已关闭。');
+        }
+        const currentUrl = String(tab.url || '').trim();
+        if (isPayPalUrl(currentUrl) || isPaymentsSuccessUrl(currentUrl)) {
+          return {
+            transitioned: true,
+            url: currentUrl,
+          };
+        }
+
+        const state = await sendTabMessageUntilStopped(tabId, PLUS_CHECKOUT_SOURCE, {
+          type: 'PLUS_CHECKOUT_GET_STATE',
+          source: 'background',
+          payload: {},
+        });
+        if (state?.error) {
+          throw new Error(state.error);
+        }
+        if (state?.hostedVerificationVisible && !verificationSubmitted) {
+          await addLog('步骤 6：检测到 hosted checkout OpenAI 验证码弹窗，正在获取并填写验证码...', 'info');
+          const verificationCode = await pollHostedCheckoutVerificationCode();
+          const verifyResult = await sendTabMessageUntilStopped(tabId, PLUS_CHECKOUT_SOURCE, {
+            type: 'RUN_HOSTED_OPENAI_CHECKOUT_STEP',
+            source: 'background',
+            payload: {
+              verificationCode,
+            },
+          });
+          if (verifyResult?.error) {
+            throw new Error(verifyResult.error);
+          }
+          verificationSubmitted = true;
+        }
+        await sleepWithStop(500);
+      }
+
+      throw new Error('步骤 6：hosted checkout OpenAI/Stripe 页面提交后长时间未跳转到 PayPal 或成功页。');
     }
 
     async function runHostedCheckoutPayPalStep(tabId, payload = {}) {

@@ -369,18 +369,156 @@ function findHostedGuestSubmitButton() {
     ]);
 }
 
+function buildHostedRandomEmail() {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let value = '';
+  for (let index = 0; index < 16; index += 1) {
+    value += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return `${value}@gmail.com`;
+}
+
+function buildHostedRandomPassword() {
+  const lowercase = 'abcdefghijklmnopqrstuvwxyz';
+  const uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const digits = '0123456789';
+  const symbols = '!@#$%^';
+  const alphabet = `${lowercase}${uppercase}${digits}${symbols}`;
+  const value = [
+    lowercase[Math.floor(Math.random() * lowercase.length)],
+    uppercase[Math.floor(Math.random() * uppercase.length)],
+    digits[Math.floor(Math.random() * digits.length)],
+    symbols[Math.floor(Math.random() * symbols.length)],
+  ];
+  while (value.length < 14) {
+    value.push(alphabet[Math.floor(Math.random() * alphabet.length)]);
+  }
+  return value.sort(() => Math.random() - 0.5).join('');
+}
+
+function buildHostedVisaCard() {
+  const prefixes = [
+    [4, 1, 4, 7],
+    [4, 1, 0, 0],
+  ];
+  const digits = prefixes[Math.floor(Math.random() * prefixes.length)].slice();
+  while (digits.length < 15) {
+    digits.push(Math.floor(Math.random() * 10));
+  }
+  const reversed = digits.slice().reverse();
+  let sum = 0;
+  for (let index = 0; index < reversed.length; index += 1) {
+    let digit = reversed[index];
+    if (index % 2 === 0) {
+      digit *= 2;
+      if (digit > 9) {
+        digit -= 9;
+      }
+    }
+    sum += digit;
+  }
+  const checkDigit = (10 - (sum % 10)) % 10;
+  digits.push(checkDigit);
+  const month = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+  const currentYear = new Date().getFullYear() % 100;
+  const year = currentYear + Math.floor(Math.random() * 4) + 2;
+  const cvv = String(Math.floor(100 + Math.random() * 900));
+  return {
+    number: digits.join(''),
+    expiry: `${month} / ${year}`,
+    cvv,
+  };
+}
+
+function dispatchHostedGenericClick(button) {
+  const rect = button.getBoundingClientRect();
+  const clientX = rect.left + rect.width / 2;
+  const clientY = rect.top + rect.height / 2;
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    view: window,
+    clientX,
+    clientY,
+  };
+  button.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+  button.dispatchEvent(new MouseEvent('mousedown', eventInit));
+  button.dispatchEvent(new PointerEvent('pointerup', eventInit));
+  button.dispatchEvent(new MouseEvent('mouseup', eventInit));
+  button.dispatchEvent(new MouseEvent('click', eventInit));
+}
+
+async function clickHostedGenericSubmitButton(retries = 0) {
+  removeHostedCaptchaArtifacts();
+  const button = findHostedGuestSubmitButton() || findEmailNextButton() || findLoginNextButton();
+  if (!button) {
+    if (retries >= 10) {
+      throw new Error('PayPal hosted checkout 未找到可点击的继续/提交按钮。');
+    }
+    await sleep(1000);
+    return clickHostedGenericSubmitButton(retries + 1);
+  }
+
+  const buttonText = normalizeText(button.textContent || '');
+  if (button.disabled) {
+    if (retries >= 10) {
+      throw new Error('PayPal hosted checkout 按钮长时间处于 disabled 状态。');
+    }
+    await sleep(1000);
+    return clickHostedGenericSubmitButton(retries + 1);
+  }
+
+  const rect = button.getBoundingClientRect();
+  if (rect.height === 0) {
+    if (retries >= 10) {
+      throw new Error('PayPal hosted checkout 按钮长时间不可见。');
+    }
+    await sleep(1000);
+    return clickHostedGenericSubmitButton(retries + 1);
+  }
+
+  dispatchHostedGenericClick(button);
+  await sleep(1000);
+  removeHostedCaptchaArtifacts();
+
+  if (hasHostedVerificationInputs()) {
+    return {
+      clicked: true,
+      verificationRequired: true,
+      buttonText,
+    };
+  }
+
+  const currentText = normalizeText(button.textContent || '');
+  if (!/processing/i.test(currentText) && currentText === buttonText) {
+    if (retries >= 10) {
+      return {
+        clicked: true,
+        verificationRequired: false,
+        buttonText,
+        retried: true,
+      };
+    }
+    await sleep(2000);
+    return clickHostedGenericSubmitButton(retries + 1);
+  }
+
+  return {
+    clicked: true,
+    verificationRequired: false,
+    buttonText,
+  };
+}
+
 function normalizeHostedVerificationCode(value = '') {
   const digits = String(value || '').replace(/\D+/g, '');
   return digits.slice(0, 6);
 }
 
 async function submitHostedPayLogin(payload = {}) {
-  const delayOperation = typeof performPayPalOperationWithDelay === 'function'
-    ? performPayPalOperationWithDelay
-    : async (_metadata, operation) => operation();
   await waitForDocumentComplete();
   removeHostedCaptchaArtifacts();
-  const email = normalizeText(payload.email || '');
+  const email = normalizeText(payload.email || buildHostedRandomEmail());
   if (!email) {
     throw new Error('PayPal hosted checkout 缺少邮箱。');
   }
@@ -388,17 +526,15 @@ async function submitHostedPayLogin(payload = {}) {
   if (!emailInput) {
     throw new Error('PayPal hosted checkout 未找到邮箱输入框。');
   }
-  const nextButton = findEmailNextButton() || findLoginNextButton();
-  if (!nextButton || !isEnabledControl(nextButton)) {
-    throw new Error('PayPal hosted checkout 未找到可点击的下一步按钮。');
-  }
-  await delayOperation({ stepKey: 'plus-checkout-create', kind: 'submit', label: 'hosted-paypal-email' }, async () => {
-    refillPayPalEmailInput(emailInput, email);
-    simulateClick(nextButton);
-  });
+  await sleep(2000);
+  refillPayPalEmailInput(emailInput, email);
+  await sleep(1000);
+  const clickResult = await clickHostedGenericSubmitButton(0);
   return {
     stage: PAYPAL_HOSTED_STAGE_LOGIN,
     submitted: true,
+    generatedEmail: email,
+    verificationRequired: Boolean(clickResult?.verificationRequired),
     nextExpected: 'guest_checkout_or_verification',
   };
 }
@@ -428,13 +564,11 @@ async function fillHostedVerificationCode(payload = {}) {
 }
 
 async function fillHostedGuestCheckout(payload = {}) {
-  const delayOperation = typeof performPayPalOperationWithDelay === 'function'
-    ? performPayPalOperationWithDelay
-    : async (_metadata, operation) => operation();
   await waitForDocumentComplete();
   startHostedCaptchaCleanupObserver();
   removeHostedCaptchaArtifacts();
 
+  await sleep(2000);
   const countrySelect = document.getElementById('country');
   if (countrySelect && String(countrySelect.value || '').trim().toUpperCase() !== 'US') {
     countrySelect.value = 'US';
@@ -442,69 +576,65 @@ async function fillHostedGuestCheckout(payload = {}) {
     await sleep(3000);
   }
 
-  const email = normalizeText(payload.email || '');
+  const card = buildHostedVisaCard();
+  const email = normalizeText(payload.email || buildHostedRandomEmail());
   const phone = normalizeText(payload.phone || PAYPAL_HOSTED_DEFAULT_PHONE);
-  const password = String(payload.password || '');
+  const password = String(payload.password || buildHostedRandomPassword());
   const firstName = normalizeText(payload.firstName || 'James');
   const lastName = normalizeText(payload.lastName || 'Smith');
-  const cardNumber = String(payload.cardNumber || '').replace(/\s+/g, '');
-  const cardExpiry = normalizeText(payload.cardExpiry || '');
-  const cardCvv = normalizeText(payload.cardCvv || '');
+  const cardNumber = String(payload.cardNumber || card.number).replace(/\s+/g, '');
+  const cardExpiry = normalizeText(payload.cardExpiry || card.expiry);
+  const cardCvv = normalizeText(payload.cardCvv || card.cvv);
   const address = payload.address && typeof payload.address === 'object' ? payload.address : {};
 
   if (!email || !password || !cardNumber || !cardExpiry || !cardCvv) {
     throw new Error('PayPal hosted checkout 缺少卡支付所需资料。');
   }
 
-  await delayOperation({ stepKey: 'plus-checkout-create', kind: 'fill', label: 'hosted-paypal-guest-form' }, async () => {
-    fillHostedInputById('email', email);
-    fillHostedInputById('phone', phone);
-    fillHostedInputById('cardNumber', cardNumber);
-    fillHostedInputById('cardExpiry', cardExpiry);
-    fillHostedInputById('cardCvv', cardCvv);
-    fillHostedInputById('password', password);
-    fillHostedInputById('firstName', firstName);
-    fillHostedInputById('lastName', lastName);
-    fillHostedInputById('billingLine1', address.street || '');
-    fillHostedInputById('billingCity', address.city || '');
-    fillHostedInputById('billingPostalCode', address.zip || '');
-    selectHostedOptionByIdText('billingState', address.state || '');
-    const termsCheckbox = document.getElementById('termsOfServiceConsentCheckbox');
-    if (termsCheckbox && !termsCheckbox.checked && isEnabledControl(termsCheckbox)) {
-      simulateClick(termsCheckbox);
-    }
-  });
+  fillHostedInputById('email', email);
+  fillHostedInputById('phone', phone);
+  fillHostedInputById('cardNumber', cardNumber);
+  fillHostedInputById('cardExpiry', cardExpiry);
+  fillHostedInputById('cardCvv', cardCvv);
+  fillHostedInputById('password', password);
+  fillHostedInputById('firstName', firstName);
+  fillHostedInputById('lastName', lastName);
+  fillHostedInputById('billingLine1', address.street || '');
+  fillHostedInputById('billingCity', address.city || '');
+  fillHostedInputById('billingPostalCode', address.zip || '');
+  fillHostedInputById('billingLine1', address.street || '');
+  selectHostedOptionByIdText('billingState', address.state || '');
 
-  const submitButton = findHostedGuestSubmitButton();
-  if (!submitButton || !isEnabledControl(submitButton)) {
-    throw new Error('PayPal hosted checkout 未找到可点击的提交按钮。');
-  }
-
-  await delayOperation({ stepKey: 'plus-checkout-create', kind: 'submit', label: 'hosted-paypal-guest-submit' }, async () => {
-    simulateClick(submitButton);
-  });
-  await sleep(1000);
+  const clickResult = await clickHostedGenericSubmitButton(0);
   removeHostedCaptchaArtifacts();
 
   return {
     stage: PAYPAL_HOSTED_STAGE_GUEST_CHECKOUT,
     submitted: true,
-    verificationRequired: hasHostedVerificationInputs(),
+    verificationRequired: Boolean(clickResult?.verificationRequired || hasHostedVerificationInputs()),
   };
 }
 
 async function clickHostedReviewConsent() {
-  const delayOperation = typeof performPayPalOperationWithDelay === 'function'
-    ? performPayPalOperationWithDelay
-    : async (_metadata, operation) => operation();
   await waitForDocumentComplete();
-  const button = findHostedReviewConsentButton();
+  const startedAt = Date.now();
+  let button = null;
+  while (Date.now() - startedAt < 30000) {
+    const pageText = normalizeText(document.body?.innerText || '');
+    if (pageText.includes('Set up once. Pay faster next time')) {
+      button = findHostedReviewConsentButton();
+      break;
+    }
+    await sleep(1000);
+  }
+  if (!button || !isEnabledControl(button)) {
+    await sleep(2000);
+    button = findHostedReviewConsentButton();
+  }
   if (!button || !isEnabledControl(button)) {
     throw new Error('PayPal hosted checkout 未找到可点击的账单确认按钮。');
   }
-  await delayOperation({ stepKey: 'plus-checkout-create', kind: 'click', label: 'hosted-paypal-review-consent' }, async () => {
-    simulateClick(button);
-  });
+  simulateClick(button);
   return {
     stage: PAYPAL_HOSTED_STAGE_REVIEW,
     submitted: true,

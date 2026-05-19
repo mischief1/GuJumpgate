@@ -55,6 +55,7 @@ if (document.documentElement.getAttribute(PLUS_CHECKOUT_LISTENER_SENTINEL) !== '
     if (
       message.type === 'CREATE_PLUS_CHECKOUT'
       || message.type === 'FILL_PLUS_BILLING_AND_SUBMIT'
+      || message.type === 'RUN_HOSTED_OPENAI_CHECKOUT_STEP'
       || message.type === 'PLUS_CHECKOUT_SELECT_PAYPAL'
       || message.type === 'PLUS_CHECKOUT_SELECT_GOPAY'
       || message.type === 'PLUS_CHECKOUT_FILL_BILLING_ADDRESS'
@@ -87,6 +88,8 @@ async function handlePlusCheckoutCommand(message) {
       return createPlusCheckoutSession(message.payload || {});
     case 'FILL_PLUS_BILLING_AND_SUBMIT':
       return fillPlusBillingAndSubmit(message.payload || {});
+    case 'RUN_HOSTED_OPENAI_CHECKOUT_STEP':
+      return runHostedOpenAiCheckoutStep(message.payload || {});
     case 'PLUS_CHECKOUT_SELECT_PAYPAL':
       return selectPlusPayPalPaymentMethod(message.payload || {});
     case 'PLUS_CHECKOUT_SELECT_GOPAY':
@@ -132,6 +135,303 @@ async function waitForDocumentComplete() {
     intervalMs: 200,
   });
   await sleep(1000);
+}
+
+function isHostedOpenAiCheckoutPage() {
+  const host = String(location?.host || '').toLowerCase();
+  return host.includes('pay.openai.com') || host.includes('checkout.stripe.com');
+}
+
+let hostedOpenAiAutocompleteObserver = null;
+
+function hideHostedOpenAiAutocomplete() {
+  const selectors = [
+    '.AddressAutocomplete-results',
+    '[class*="AddressAutocomplete"]',
+    '#billing-address-autocomplete-results',
+  ];
+  document.querySelectorAll(selectors.join(', ')).forEach((node) => {
+    try {
+      node.style.setProperty('display', 'none', 'important');
+      node.style.setProperty('visibility', 'hidden', 'important');
+      node.style.setProperty('pointer-events', 'none', 'important');
+      node.style.setProperty('height', '0', 'important');
+      node.style.setProperty('overflow', 'hidden', 'important');
+    } catch {
+      // Ignore readonly style failures.
+    }
+  });
+}
+
+function startHostedOpenAiAutocompleteObserver() {
+  if (hostedOpenAiAutocompleteObserver || !isHostedOpenAiCheckoutPage()) {
+    return;
+  }
+  hostedOpenAiAutocompleteObserver = new MutationObserver(() => {
+    hideHostedOpenAiAutocomplete();
+  });
+  hostedOpenAiAutocompleteObserver.observe(document.documentElement || document.body, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+function stopHostedOpenAiAutocompleteObserver() {
+  if (!hostedOpenAiAutocompleteObserver) {
+    return;
+  }
+  hostedOpenAiAutocompleteObserver.disconnect();
+  hostedOpenAiAutocompleteObserver = null;
+}
+
+function hasHostedOpenAiCaptcha() {
+  return Boolean(
+    document.querySelector('iframe[name="recaptcha"]')
+    || document.getElementById('captchaHeading')
+    || document.querySelector('#captcha-standalone')
+    || document.querySelector('form[action="/auth/validatecaptcha"]')
+  );
+}
+
+function removeHostedOpenAiCaptcha() {
+  let removed = false;
+  const selectors = [
+    '#captcha-standalone',
+    '.captcha-overlay',
+    '.captcha-container',
+  ];
+  selectors.forEach((selector) => {
+    document.querySelectorAll(selector).forEach((node) => {
+      try {
+        node.remove();
+        removed = true;
+      } catch {
+        // Ignore readonly nodes.
+      }
+    });
+  });
+  return removed;
+}
+
+function hasHostedOpenAiVerificationPopup() {
+  return Boolean(document.getElementById('ci-ciBasic-0'));
+}
+
+function fillHostedOpenAiInputById(id, value) {
+  const input = document.getElementById(String(id || '').trim());
+  if (!input) {
+    return false;
+  }
+  fillInput(input, String(value || ''));
+  return true;
+}
+
+function fillHostedOpenAiInputBySelector(selector, value) {
+  const input = document.querySelector(String(selector || '').trim());
+  if (!input) {
+    return false;
+  }
+  fillInput(input, String(value || ''));
+  return true;
+}
+
+function fillHostedOpenAiSelectByIdText(id, text) {
+  const select = document.getElementById(String(id || '').trim());
+  const expected = normalizeText(text);
+  if (!select || !expected) {
+    return false;
+  }
+  const match = Array.from(select.options || []).find((option) => {
+    const optionText = normalizeText(option?.textContent || option?.label || '');
+    const optionValue = normalizeText(option?.value || '');
+    return optionText.toLowerCase().includes(expected.toLowerCase())
+      || optionValue.toLowerCase().includes(expected.toLowerCase());
+  });
+  if (!match) {
+    return false;
+  }
+  select.value = match.value;
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+  return true;
+}
+
+function findHostedOpenAiPayPalButton() {
+  return document.querySelector('[data-testid="paypal-accordion-item-button"]')
+    || document.querySelector('.paypal-accordion-item button');
+}
+
+function findHostedOpenAiSubmitButton() {
+  const direct = document.querySelector('button[data-testid="submit-button"]')
+    || document.querySelector('button[data-testid="hosted-payment-submit-button"]')
+    || document.querySelector('button[data-atomic-wait-intent="Submit_Email"]')
+    || document.querySelector('button.SubmitButton--complete');
+  if (direct) {
+    return direct;
+  }
+  const buttons = Array.from(document.querySelectorAll('button'));
+  return buttons.find((button) => {
+    const text = normalizeText(button.textContent || '');
+    return text === '下一页'
+      || text === 'Next'
+      || text === 'Pay'
+      || text === 'Continue'
+      || text === 'Agree'
+      || text.toLowerCase().includes('subscribe');
+  }) || null;
+}
+
+function dispatchHostedOpenAiClick(button) {
+  const rect = button.getBoundingClientRect();
+  const clientX = rect.left + rect.width / 2;
+  const clientY = rect.top + rect.height / 2;
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    view: window,
+    clientX,
+    clientY,
+  };
+  button.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+  button.dispatchEvent(new MouseEvent('mousedown', eventInit));
+  button.dispatchEvent(new PointerEvent('pointerup', eventInit));
+  button.dispatchEvent(new MouseEvent('mouseup', eventInit));
+  button.dispatchEvent(new MouseEvent('click', eventInit));
+}
+
+async function clickHostedOpenAiSubmitButton(retries = 0) {
+  if (hasHostedOpenAiCaptcha()) {
+    removeHostedOpenAiCaptcha();
+  }
+  const button = findHostedOpenAiSubmitButton();
+  if (!button) {
+    if (retries >= 10) {
+      throw new Error('hosted checkout 页面未找到可点击的提交按钮。');
+    }
+    await sleep(1000);
+    return clickHostedOpenAiSubmitButton(retries + 1);
+  }
+
+  const buttonText = normalizeText(button.textContent || '');
+  if (button.disabled) {
+    if (retries >= 10) {
+      throw new Error('hosted checkout 页面提交按钮长时间处于 disabled 状态。');
+    }
+    await sleep(1000);
+    return clickHostedOpenAiSubmitButton(retries + 1);
+  }
+
+  const rect = button.getBoundingClientRect();
+  if (rect.height === 0) {
+    if (retries >= 10) {
+      throw new Error('hosted checkout 页面提交按钮长时间不可见。');
+    }
+    await sleep(1000);
+    return clickHostedOpenAiSubmitButton(retries + 1);
+  }
+
+  stopHostedOpenAiAutocompleteObserver();
+  hideHostedOpenAiAutocomplete();
+  document.activeElement?.blur?.();
+  dispatchHostedOpenAiClick(button);
+  await sleep(1000);
+
+  startHostedOpenAiAutocompleteObserver();
+  hideHostedOpenAiAutocomplete();
+  if (hasHostedOpenAiCaptcha()) {
+    removeHostedOpenAiCaptcha();
+  }
+  if (hasHostedOpenAiVerificationPopup()) {
+    return {
+      clicked: true,
+      verificationPopupVisible: true,
+      buttonText,
+    };
+  }
+
+  const currentText = normalizeText(button.textContent || '');
+  if (!/processing/i.test(currentText) && currentText === buttonText) {
+    if (retries >= 10) {
+      return {
+        clicked: true,
+        verificationPopupVisible: false,
+        buttonText,
+        retried: true,
+      };
+    }
+    await sleep(2000);
+    return clickHostedOpenAiSubmitButton(retries + 1);
+  }
+
+  return {
+    clicked: true,
+    verificationPopupVisible: false,
+    buttonText,
+  };
+}
+
+async function fillHostedOpenAiVerificationCode(verificationCode = '') {
+  const code = String(verificationCode || '').replace(/\D+/g, '').slice(0, 6);
+  if (code.length !== 6) {
+    throw new Error('hosted checkout OpenAI 验证码无效。');
+  }
+  for (let index = 0; index < 6; index += 1) {
+    if (!fillHostedOpenAiInputById(`ci-ciBasic-${index}`, code[index] || '')) {
+      throw new Error('hosted checkout OpenAI 页面未找到完整的验证码输入框。');
+    }
+  }
+  return {
+    verificationPopupVisible: true,
+    verificationCodeFilled: true,
+  };
+}
+
+async function runHostedOpenAiCheckoutStep(payload = {}) {
+  await waitForDocumentComplete();
+  if (!isHostedOpenAiCheckoutPage()) {
+    throw new Error('当前页面不是 hosted checkout OpenAI/Stripe 页面。');
+  }
+
+  startHostedOpenAiAutocompleteObserver();
+  hideHostedOpenAiAutocomplete();
+  removeHostedOpenAiCaptcha();
+
+  if (payload.verificationCode) {
+    return fillHostedOpenAiVerificationCode(payload.verificationCode);
+  }
+
+  await sleep(2000);
+  const payPalButton = findHostedOpenAiPayPalButton();
+  if (payPalButton) {
+    simulateClick(payPalButton);
+    await sleep(500);
+    simulateClick(payPalButton);
+  }
+
+  await sleep(3000);
+
+  const address = payload.address && typeof payload.address === 'object' ? payload.address : {};
+  fillHostedOpenAiInputBySelector('#billingAddressLine1', address.street || '');
+  fillHostedOpenAiInputBySelector('#billingLocality', address.city || '');
+  fillHostedOpenAiInputBySelector('#billingPostalCode', address.zip || '');
+  fillHostedOpenAiSelectByIdText('billingAdministrativeArea', address.state || '');
+
+  const checkbox = document.getElementById('termsOfServiceConsentCheckbox');
+  if (checkbox && !checkbox.checked) {
+    simulateClick(checkbox);
+  }
+
+  document.activeElement?.blur?.();
+  for (let count = 0; count < 10; count += 1) {
+    hideHostedOpenAiAutocomplete();
+    await sleep(300);
+  }
+
+  await sleep(3500);
+  const clickResult = await clickHostedOpenAiSubmitButton(0);
+  return {
+    ...clickResult,
+    hostedVerificationVisible: hasHostedOpenAiVerificationPopup(),
+  };
 }
 
 function isVisibleElement(el) {
@@ -1738,6 +2038,9 @@ async function inspectPlusCheckoutState(options = {}) {
   const state = {
     url: location.href,
     readyState: document.readyState,
+    hostedOpenAiPage: isHostedOpenAiCheckoutPage(),
+    hostedVerificationVisible: hasHostedOpenAiVerificationPopup(),
+    hostedPayPalButtonFound: Boolean(findHostedOpenAiPayPalButton()),
     countryText: readCountryText(),
     hasPayPal: Boolean(findPayPalPaymentMethodTarget()),
     hasGoPay: Boolean(findGoPayPaymentMethodTarget()),
